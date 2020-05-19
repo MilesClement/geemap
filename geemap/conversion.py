@@ -1,10 +1,15 @@
 ''' Module for converting Google Earth Engine (GEE) JavaScripts to Python scripts and Jupyter notebooks.
 
 To convert a GEE JavaScript to Python script:                                       js_to_python(in_file out_file)
+
 To convert all GEE JavaScripts in a folder recursively to Python scripts:           js_to_python_dir(in_dir, out_dir)
+
 To convert a GEE Python script to Jupyter notebook:                                 py_to_ipynb(in_file, template_file, out_file)
+
 To convert all GEE Python scripts in a folder recursively to Jupyter notebooks:     py_to_ipynb_dir(in_dir, template_file, out_dir)
+
 To execute a Jupyter notebook and save output cells:                                execute_notebook(in_file)
+
 To execute all Jupyter notebooks in a folder recursively:                           execute_notebook_dir(in_dir)           
 
 '''
@@ -441,7 +446,7 @@ def js_to_python(in_file, out_file=None, use_qgis=True, github_repo=None):
     return output
 
 
-def create_new_cell(contents):
+def create_new_cell(contents, replace=False):
     """Create a new cell in Jupyter notebook based on the contents.
 
     Args:
@@ -449,7 +454,7 @@ def create_new_cell(contents):
     """
     from IPython.core.getipython import get_ipython
     shell = get_ipython()
-    shell.set_next_input(contents, replace=False)
+    shell.set_next_input(contents, replace=replace)
 
 
 def js_snippet_to_py(in_js_snippet, add_new_cell=True, import_ee=True, import_geemap=True, show_map=True):
@@ -918,7 +923,7 @@ def download_from_url(url, out_file_name=None, out_dir='.', unzip=True):
         out_file_name = in_file_name
     out_file_path = os.path.join(os.path.abspath(out_dir), out_file_name)
 
-    print('Downloading {} ...'.format(in_file_name))
+    print('Downloading {} ...'.format(url))
 
     try:
         urllib.request.urlretrieve(url, out_file_path)

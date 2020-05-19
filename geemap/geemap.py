@@ -5,12 +5,16 @@ ipyleaflet functions use snake case, such as add_tile_layer(), add_wms_layer(), 
 
 import colour
 import ee
+import geocoder
 import ipyleaflet
+import math
 import os
+import time
 import ipywidgets as widgets
 from bqplot import pyplot as plt
-# from colour import Color
+from ipyfilechooser import FileChooser
 from ipyleaflet import *
+from IPython.display import display
 from .basemaps import ee_basemaps
 from .conversion import *
 from .legends import builtin_legends
@@ -22,7 +26,7 @@ def ee_initialize():
     """
     try:
         ee.Initialize()
-    except Exception as e:
+    except:
         ee.Authenticate()
         ee.Initialize()
 
@@ -31,7 +35,7 @@ class Map(ipyleaflet.Map):
     """The Map class inherits from ipyleaflet.Map
 
     Args:
-        ipyleaflet (object): An ipyleaflet map instance.
+        ipyleaflet (object): An ipyleaflet map instance. The arguments you can pass to the Map can be found at https://ipyleaflet.readthedocs.io/en/latest/api_reference/map.html
 
     Returns:
         object: ipyleaflet map object.
@@ -39,7 +43,7 @@ class Map(ipyleaflet.Map):
 
     def __init__(self, **kwargs):
 
-        # Authenticates Earth Engine and initialize an Earth Engine session
+        # Authenticates Earth Engine and initializes an Earth Engine session
         ee_initialize()
 
         # Default map center location and zoom level
@@ -63,10 +67,242 @@ class Map(ipyleaflet.Map):
         else:
             kwargs['zoom'] = zoom
 
-        # Inherit the ipyleaflet Map class
+        # Inherits the ipyleaflet Map class
         super().__init__(**kwargs)
         self.scroll_wheel_zoom = True
         self.layout.height = '550px'
+
+        self.clear_controls()
+
+        self.draw_count = 0  # The number of shapes drawn by the user using the DrawControl
+        # The list of Earth Engine Geometry objects converted from geojson
+        self.draw_features = []
+        # The Earth Engine Geometry object converted from the last drawn feature
+        self.draw_last_feature = None
+        self.draw_layer = None
+        self.draw_last_json = None
+        self.draw_last_bounds = None
+
+        self.plot_widget = None  # The plot widget for plotting Earth Engine data
+        self.plot_control = None  # The plot control for interacting plotting
+        self.random_marker = None
+
+        self.legend_widget = None
+        self.legend_control = None
+
+        self.ee_layers = []
+        self.ee_layer_names = []
+        self.ee_raster_layers = []
+        self.ee_raster_layer_names = []
+
+        self.search_locations = None
+        self.search_loc_marker = None
+        self.search_loc_geom = None
+        self.search_datasets = None
+        self.screenshot = None
+        self.toolbar = None
+        self.toolbar_button = None
+
+        # Adds search button and search box
+        search_button = widgets.ToggleButton(
+            value=False,
+            tooltip='Search location/data',
+            icon='search'
+        )
+        search_button.layout.width = '37px'
+
+        search_type = widgets.ToggleButtons(
+            options=['name/address', 'lat-lon', 'data'],
+            tooltips=['Search by place name or address',
+                      'Search by lat-lon coordinates', 'Search Earth Engine data catalog']
+        )
+        search_type.style.button_width = '110px'
+
+        search_box = widgets.Text(
+            placeholder='Search by place name or address',
+            tooltip='Search location',
+        )
+        search_box.layout.width = '340px'
+
+        search_output = widgets.Output(
+            layout={'max_width': '340px', 'max_height': '250px', 'overflow': 'scroll'})
+
+        search_results = widgets.RadioButtons()
+
+        assets_dropdown = widgets.Dropdown()
+        assets_dropdown.layout.min_width = '279px'
+        assets_dropdown.layout.max_width = '279px'
+        assets_dropdown.options = []
+
+        import_btn = widgets.Button(
+            description='import',
+            button_style='primary',
+            tooltip='Click to import the selected asset',
+        )
+        import_btn.layout.min_width = '57px'
+        import_btn.layout.max_width = '57px'
+
+        def import_btn_clicked(b):
+            if assets_dropdown.value != '':
+                datasets = self.search_datasets
+                dataset = datasets[assets_dropdown.index]
+                dataset_uid = 'dataset_' + random_string(string_length=3)
+                line1 = '{} = {}\n'.format(
+                    dataset_uid, dataset['ee_id_snippet'])
+                line2 = 'Map.addLayer(' + dataset_uid + \
+                    ', {}, "' + dataset['id'] + '")'
+                contents = ''.join([line1, line2])
+                create_code_cell(contents)
+
+        import_btn.on_click(import_btn_clicked)
+
+        html_widget = widgets.HTML()
+
+        def dropdown_change(change):
+            dropdown_index = assets_dropdown.index
+            if dropdown_index is not None and dropdown_index >= 0:
+                with search_output:
+                    search_output.clear_output(wait=True)
+                    print('Loading ...')
+                    datasets = self.search_datasets
+                    dataset = datasets[dropdown_index]
+                    dataset_html = ee_data_html(dataset)
+                    html_widget.value = dataset_html
+                    search_output.clear_output(wait=True)
+                    display(html_widget)
+
+        assets_dropdown.observe(dropdown_change, names='value')
+
+        assets_combo = widgets.HBox()
+        assets_combo.children = [import_btn, assets_dropdown]
+
+        def search_result_change(change):
+            result_index = search_results.index
+            locations = self.search_locations
+            location = locations[result_index]
+            latlon = (location.lat, location.lng)
+            self.search_loc_geom = ee.Geometry.Point(
+                location.lng, location.lat)
+            marker = self.search_loc_marker
+            marker.location = latlon
+            self.center = latlon
+
+        search_results.observe(search_result_change, names='value')
+
+        def search_btn_click(change):
+            if change['new']:
+                search_widget.children = [search_button, search_result_widget]
+            else:
+                search_widget.children = [search_button]
+                search_result_widget.children = [search_type, search_box]
+
+        search_button.observe(search_btn_click, 'value')
+
+        def search_type_changed(change):
+            search_box.value = ''
+            search_output.clear_output()
+            if change['new'] == 'name/address':
+                search_box.placeholder = 'Search by place name or address, e.g., Paris'
+                assets_dropdown.options = []
+                search_result_widget.children = [
+                    search_type, search_box, search_output]
+            elif change['new'] == 'lat-lon':
+                search_box.placeholder = 'Search by lat-lon, e.g., 40, -100'
+                assets_dropdown.options = []
+                search_result_widget.children = [
+                    search_type, search_box, search_output]
+            elif change['new'] == 'data':
+                search_box.placeholder = 'Search GEE data catalog by keywords, e.g., elevation'
+                search_result_widget.children = [
+                    search_type, search_box, assets_combo, search_output]
+
+        search_type.observe(search_type_changed, names='value')
+
+        def search_box_callback(text):
+
+            if text.value != '':
+
+                if search_type.value == 'name/address':
+                    g = geocode(text.value)
+                elif search_type.value == 'lat-lon':
+                    g = geocode(text.value, reverse=True)
+                    if g is None and latlon_from_text(text.value):
+                        search_output.clear_output()
+                        latlon = latlon_from_text(text.value)
+                        self.search_loc_geom = ee.Geometry.Point(
+                            latlon[1], latlon[0])
+                        if self.search_loc_marker is None:
+                            marker = Marker(
+                                location=latlon, draggable=False, name='Search location')
+                            self.search_loc_marker = marker
+                            self.add_layer(marker)
+                            self.center = latlon
+                        else:
+                            marker = self.search_loc_marker
+                            marker.location = latlon
+                            self.center = latlon
+                        with search_output:
+                            print('No address found for {}'.format(latlon))
+                        return
+                elif search_type.value == 'data':
+                    search_output.clear_output()
+                    with search_output:
+                        print('Searching ...')
+                    self.default_style = {'cursor': 'wait'}
+                    ee_assets = search_ee_data(text.value)
+                    self.search_datasets = ee_assets
+                    asset_titles = [x['title'] for x in ee_assets]
+                    assets_dropdown.options = asset_titles
+                    search_output.clear_output()
+                    if len(ee_assets) > 0:
+                        html_widget.value = ee_data_html(ee_assets[0])
+                    with search_output:
+                        display(html_widget)
+
+                    self.default_style = {'cursor': 'default'}
+
+                    return
+
+                self.search_locations = g
+                if g is not None and len(g) > 0:
+                    top_loc = g[0]
+                    latlon = (top_loc.lat, top_loc.lng)
+                    self.search_loc_geom = ee.Geometry.Point(
+                        top_loc.lng, top_loc.lat)
+                    if self.search_loc_marker is None:
+                        marker = Marker(
+                            location=latlon, draggable=False, name='Search location')
+                        self.search_loc_marker = marker
+                        self.add_layer(marker)
+                        self.center = latlon
+                    else:
+                        marker = self.search_loc_marker
+                        marker.location = latlon
+                        self.center = latlon
+                    search_results.options = [x.address for x in g]
+                    search_result_widget.children = [
+                        search_type, search_box, search_output]
+                    with search_output:
+                        search_output.clear_output(wait=True)
+                        display(search_results)
+                else:
+                    with search_output:
+                        search_output.clear_output()
+                        print('No results could be found.')
+
+        search_box.on_submit(search_box_callback)
+
+        search_result_widget = widgets.VBox()
+        search_result_widget.children = [search_type, search_box]
+
+        search_widget = widgets.HBox()
+        search_widget.children = [search_button]
+        search_control = WidgetControl(
+            widget=search_widget, position='topleft')
+
+        self.add_control(control=search_control)
+
+        self.add_control(ZoomControl(position='topleft'))
 
         layer_control = LayersControl(position='topright')
         self.add_control(layer_control)
@@ -98,31 +334,14 @@ class Map(ipyleaflet.Map):
                                    circlemarker={},
                                    )
 
-        self.draw_count = 0  # The number of shapes drawn by the user using the DrawControl
-        # The list of Earth Engine Geometry objects converted from geojson
-        self.draw_features = []
-        # The Earth Engine Geometry object converted from the last drawn feature
-        self.draw_last_feature = None
-        self.draw_layer = None
-
-        self.plot_widget = None  # The plot widget for plotting Earth Engine data
-        self.plot_control = None  # The plot control for interacting plotting
-        self.random_marker = None
-
-        self.legend_widget = None
-        self.legend_control = None
-
-        self.ee_layers = []
-        self.ee_layer_names = []
-        self.ee_raster_layers = []
-        self.ee_raster_layer_names = []
-
         # Handles draw events
         def handle_draw(target, action, geo_json):
             try:
                 self.draw_count += 1
                 geom = geojson_to_ee(geo_json, False)
                 feature = ee.Feature(geom)
+                self.draw_last_json = geo_json
+                self.draw_last_bounds = minimum_bounding_box(geo_json)
                 self.draw_last_feature = feature
                 self.draw_features.append(feature)
                 collection = ee.FeatureCollection(self.draw_features)
@@ -230,10 +449,151 @@ class Map(ipyleaflet.Map):
 
         plot_checkbox.observe(plot_chk_changed)
 
+        tool_output = widgets.Output()
+        tool_output.clear_output(wait=True)
+
+        save_map_widget = widgets.VBox()
+
+        save_type = widgets.ToggleButtons(
+            options=['HTML', 'PNG', 'JPG'],
+            tooltips=['Save the map as an HTML file',
+                      'Take a screenshot and save as a PNG file',
+                      'Take a screenshot and save as a JPG file']
+        )
+
+        # download_dir = os.getcwd()
+        file_chooser = FileChooser(os.getcwd())
+        file_chooser.default_filename = 'my_map.html'
+        file_chooser.use_dir_icons = False
+
+        ok_cancel = widgets.ToggleButtons(
+            options=['OK', 'Cancel'],
+            tooltips=['OK', 'Cancel'],
+            button_style='primary'
+        )
+        ok_cancel.value = None
+
+        def save_type_changed(change):
+            ok_cancel.value = None
+            # file_chooser.reset()
+            file_chooser.default_path = os.getcwd()
+            if change['new'] == 'HTML':
+                file_chooser.default_filename = 'my_map.html'
+            elif change['new'] == 'PNG':
+                file_chooser.default_filename = 'my_map.png'
+            elif change['new'] == 'JPG':
+                file_chooser.default_filename = 'my_map.jpg'
+            save_map_widget.children = [save_type, file_chooser]
+
+        def chooser_callback(chooser):
+            # file_chooser.default_path = os.getcwd()
+            save_map_widget.children = [save_type, file_chooser, ok_cancel]
+
+        def ok_cancel_clicked(change):
+            if change['new'] == 'OK':
+                file_path = file_chooser.selected
+                ext = os.path.splitext(file_path)[1]
+                if save_type.value == 'HTML' and ext.upper() == '.HTML':
+                    tool_output.clear_output()
+                    self.to_html(file_path)
+                elif save_type.value == 'PNG' and ext.upper() == '.PNG':
+                    tool_output.clear_output()
+                    self.toolbar_button.value = False
+                    time.sleep(1)
+                    screen_capture(outfile=file_path)
+                elif save_type.value == 'JPG' and ext.upper() == '.JPG':
+                    tool_output.clear_output()
+                    self.toolbar_button.value = False
+                    time.sleep(1)
+                    screen_capture(outfile=file_path)
+                else:
+                    label = widgets.Label(
+                        value="The selected file extension does not match the selected exporting type.")
+                    save_map_widget.children = [save_type, file_chooser, label]
+                self.toolbar_reset()
+            elif change['new'] == 'Cancel':
+                tool_output.clear_output()
+                self.toolbar_reset()
+        save_type.observe(save_type_changed, names='value')
+        ok_cancel.observe(ok_cancel_clicked, names='value')
+
+        file_chooser.register_callback(chooser_callback)
+
+        save_map_widget.children = [save_type, file_chooser]
+
+        tools = {
+            'mouse-pointer': 'pointer',
+            'camera': 'to_image',
+            'info': 'identify',
+            'map-marker': 'plotting'
+        }
+        icons = ['mouse-pointer', 'camera', 'info', 'map-marker']
+        tooltips = ['Default pointer',
+                    'Save map as HTML or image', 'Inspector', 'Plotting']
+        icon_width = '42px'
+        icon_height = '40px'
+        n_cols = 2
+        n_rows = math.ceil(len(icons) / n_cols)
+
+        toolbar_grid = widgets.GridBox(children=[widgets.ToggleButton(layout=widgets.Layout(width='auto', height='auto'),
+                                                                      button_style='primary', icon=icons[i], tooltip=tooltips[i]) for i in range(len(icons))],
+                                       layout=widgets.Layout(
+            width='90px',
+            grid_template_columns=(icon_width + ' ') * 2,
+            grid_template_rows=(icon_height + ' ') * n_rows,
+            grid_gap='1px 1px')
+        )
+        self.toolbar = toolbar_grid
+
+        def tool_callback(change):
+            if change['new']:
+                current_tool = change['owner']
+                for tool in toolbar_grid.children:
+                    if not tool is current_tool:
+                        tool.value = False
+                tool = change['owner']
+                if tools[tool.icon] == 'to_image':
+                    with tool_output:
+                        tool_output.clear_output()
+                        display(save_map_widget)
+            else:
+                tool_output.clear_output()
+                save_map_widget.children = [save_type, file_chooser]
+
+        for tool in toolbar_grid.children:
+            tool.observe(tool_callback, 'value')
+
+        toolbar_button = widgets.ToggleButton(
+            value=False,
+            tooltip='Toolbar',
+            icon='wrench'
+        )
+        toolbar_button.layout.width = '37px'
+        self.toolbar_button = toolbar_button
+
+        def toolbar_btn_click(change):
+            if change['new']:
+                toolbar_widget.children = [toolbar_button, toolbar_grid]
+            else:
+                toolbar_widget.children = [toolbar_button]
+                tool_output.clear_output()
+                self.toolbar_reset()
+
+        toolbar_button.observe(toolbar_btn_click, 'value')
+
+        toolbar_widget = widgets.VBox()
+        toolbar_widget.children = [toolbar_button]
+        toolbar_control = WidgetControl(
+            widget=toolbar_widget, position='topright')
+        self.add_control(toolbar_control)
+
+        tool_output_control = WidgetControl(
+            widget=tool_output, position='topright')
+        self.add_control(tool_output_control)
+
         def handle_interaction(**kwargs):
 
             latlon = kwargs.get('coordinates')
-            # print(latlon)
             if kwargs.get('type') == 'click' and self.inspector_checked:
                 self.default_style = {'cursor': 'wait'}
 
@@ -459,7 +819,11 @@ class Map(ipyleaflet.Map):
         lon = 0
         bounds = [[lat, lon], [lat, lon]]
         if isinstance(ee_object, ee.geometry.Geometry):
-            centroid = ee_object.centroid()
+            centroid = ee_object.centroid(1)
+            lon, lat = centroid.getInfo()['coordinates']
+            bounds = [[lat, lon], [lat, lon]]
+        elif isinstance(ee_object, ee.feature.Feature):
+            centroid = ee_object.geometry().centroid(1)
             lon, lat = centroid.getInfo()['coordinates']
             bounds = [[lat, lon], [lat, lon]]
         elif isinstance(ee_object, ee.featurecollection.FeatureCollection):
@@ -490,7 +854,6 @@ class Map(ipyleaflet.Map):
         Returns:
             float: Map resolution in meters.
         """
-        import math
         zoom_level = self.zoom
         # Reference: https://blogs.bing.com/maps/2006/02/25/map-control-zoom-levels-gt-resolution
         resolution = 156543.04 * math.cos(0) / math.pow(2, zoom_level)
@@ -893,7 +1256,7 @@ class Map(ipyleaflet.Map):
     setControlVisibility = set_control_visibility
 
     def add_layer_control(self):
-        """Adds layer basemap to the map.
+        """Adds the layer control to the map.
         """
         pass
 
@@ -922,6 +1285,124 @@ class Map(ipyleaflet.Map):
         except Exception as e:
             print(e)
             print('The provided layers are invalid!')
+
+    def ts_inspector(self, left_ts, right_ts, left_names, right_names, left_vis={}, right_vis={}):
+        """Creates a split-panel map for inspecting timeseries images.
+
+        Args:
+            left_ts (object): An ee.ImageCollection to show on the left panel.
+            right_ts (object): An ee.ImageCollection to show on the right panel.
+            left_names (list): A list of names to show under the left dropdown.
+            right_names (list): A list of names to show under the right dropdown.
+            left_vis (dict, optional): Visualization parameters for the left layer. Defaults to {}.
+            right_vis (dict, optional): Visualization parameters for the right layer. Defaults to {}.
+        """
+        left_count = int(left_ts.size().getInfo())
+        right_count = int(right_ts.size().getInfo())
+
+        if left_count != len(left_names):
+            print(
+                'The number of images in left_ts must match the number of layer names in left_names.')
+            return
+        if right_count != len(right_names):
+            print(
+                'The number of images in right_ts must match the number of layer names in right_names.')
+            return
+
+        left_layer = TileLayer(
+            url='https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}',
+            attribution='Google',
+            name='Google Maps'
+        )
+        right_layer = TileLayer(
+            url='https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}',
+            attribution='Google',
+            name='Google Maps'
+        )
+
+        self.clear_controls()
+        left_dropdown = widgets.Dropdown(options=left_names, value=None)
+        right_dropdown = widgets.Dropdown(options=right_names, value=None)
+        left_dropdown.layout.max_width = '130px'
+        right_dropdown.layout.max_width = '130px'
+
+        left_control = WidgetControl(widget=left_dropdown, position='topleft')
+        right_control = WidgetControl(
+            widget=right_dropdown, position='topright')
+
+        self.add_control(control=left_control)
+        self.add_control(control=right_control)
+
+        self.add_control(ZoomControl(position='topleft'))
+        self.add_control(ScaleControl(position='bottomleft'))
+        self.add_control(FullScreenControl())
+
+        def left_dropdown_change(change):
+            left_dropdown_index = left_dropdown.index
+            if left_dropdown_index is not None and left_dropdown_index >= 0:
+                try:
+                    if isinstance(left_ts, ee.ImageCollection):
+                        left_image = left_ts.toList(
+                            left_ts.size()).get(left_dropdown_index)
+                    elif isinstance(left_ts, ee.List):
+                        left_image = left_ts.get(left_dropdown_index)
+                    else:
+                        print('The left_ts argument must be an ImageCollection.')
+                        return
+
+                    if isinstance(left_image, ee.ImageCollection):
+                        left_image = ee.Image(left_image.mosaic())
+                    elif isinstance(left_image, ee.Image):
+                        pass
+                    else:
+                        left_image = ee.Image(left_image)
+
+                    left_image = ee_tile_layer(
+                        left_image, left_vis, left_names[left_dropdown_index])
+                    left_layer.url = left_image.url
+                except Exception as e:
+                    print(e)
+                    return
+
+        left_dropdown.observe(left_dropdown_change, names='value')
+
+        def right_dropdown_change(change):
+            right_dropdown_index = right_dropdown.index
+            if right_dropdown_index is not None and right_dropdown_index >= 0:
+                try:
+                    if isinstance(right_ts, ee.ImageCollection):
+                        right_image = right_ts.toList(
+                            left_ts.size()).get(right_dropdown_index)
+                    elif isinstance(right_ts, ee.List):
+                        right_image = right_ts.get(right_dropdown_index)
+                    else:
+                        print('The left_ts argument must be an ImageCollection.')
+                        return
+
+                    if isinstance(right_image, ee.ImageCollection):
+                        right_image = ee.Image(right_image.mosaic())
+                    elif isinstance(right_image, ee.Image):
+                        pass
+                    else:
+                        right_image = ee.Image(right_image)
+
+                    right_image = ee_tile_layer(
+                        right_image, right_vis, right_names[right_dropdown_index])
+                    right_layer.url = right_image.url
+                except Exception as e:
+                    print(e)
+                    return
+
+        right_dropdown.observe(right_dropdown_change, names='value')
+
+        try:
+
+            split_control = ipyleaflet.SplitMapControl(
+                left_layer=left_layer, right_layer=right_layer)
+            self.add_control(split_control)
+
+        except Exception as e:
+            print(e)
 
     def basemap_demo(self):
         """A demo for using geemap basemaps.
@@ -1031,7 +1512,7 @@ class Map(ipyleaflet.Map):
 
         allowed_builtin_legends = builtin_legends.keys()
         if builtin_legend is not None:
-            builtin_legend = builtin_legend.upper()
+            # builtin_legend = builtin_legend.upper()
             if builtin_legend not in allowed_builtin_legends:
                 print('The builtin legend must be one of the following: {}'.format(
                     ', '.join(allowed_builtin_legends)))
@@ -1103,6 +1584,275 @@ class Map(ipyleaflet.Map):
 
         except Exception as e:
             print(e)
+
+    def image_overlay(self, url, bounds, name):
+        """Overlays an image from the Internet or locally on the map.
+
+        Args:
+            url (str): http URL or local file path to the image.
+            bounds (tuple): bounding box of the image in the format of (lower_left(lat, lon), upper_right(lat, lon)), such as ((13, -130), (32, -100)).
+            name (str): name of the layer to show on the layer control.
+        """
+        from base64 import b64encode
+        from PIL import Image, ImageSequence
+        from io import BytesIO
+        try:
+            if not url.startswith('http'):
+
+                if not os.path.exists(url):
+                    print('The provided file does not exist.')
+                    return
+
+                ext = os.path.splitext(url)[1][1:]  # file extension
+                image = Image.open(url)
+
+                f = BytesIO()
+                if ext.lower() == 'gif':
+                    frames = []
+                    # Loop over each frame in the animated image
+                    for frame in ImageSequence.Iterator(image):
+                        frame = frame.convert('RGBA')
+                        b = BytesIO()
+                        frame.save(b, format="gif")
+                        frame = Image.open(b)
+                        frames.append(frame)
+                    frames[0].save(f, format='GIF', save_all=True,
+                                   append_images=frames[1:], loop=0)
+                else:
+                    image.save(f, ext)
+
+                data = b64encode(f.getvalue())
+                data = data.decode('ascii')
+                url = 'data:image/{};base64,'.format(ext) + data
+            img = ipyleaflet.ImageOverlay(url=url, bounds=bounds, name=name)
+            self.add_layer(img)
+        except Exception as e:
+            print(e)
+            return
+
+    def video_overlay(self, url, bounds, name):
+        """Overlays a video from the Internet on the map.
+
+        Args:
+            url (str): http URL of the video, such as "https://www.mapbox.com/bites/00188/patricia_nasa.webm"
+            bounds (tuple): bounding box of the video in the format of (lower_left(lat, lon), upper_right(lat, lon)), such as ((13, -130), (32, -100)).
+            name (str): name of the layer to show on the layer control.
+        """
+        try:
+            video = ipyleaflet.VideoOverlay(url=url, bounds=bounds, name=name)
+            self.add_layer(video)
+        except Exception as e:
+            print(e)
+            return
+
+    def add_landsat_ts_gif(self, layer_name='Timelapse', roi=None, label=None, start_year=1984, end_year=2019, start_date='06-10', end_date='09-20', bands=['NIR', 'Red', 'Green'], vis_params=None, dimensions=768, frames_per_second=10, font_size=30, font_color='black', add_progress_bar=True, progress_bar_color='white', progress_bar_height=5, out_gif=None):
+        """Adds a Landsat timelapse to the map.
+
+        Args:
+            layer_name (str, optional): Layer name to show under the layer control. Defaults to 'Timelapse'.
+            roi (object, optional): Region of interest to create the timelapse. Defaults to None.
+            label (str, optional): A label to shown on the GIF, such as place name. Defaults to None.
+            start_year (int, optional): Starting year for the timelapse. Defaults to 1984.
+            end_year (int, optional): Ending year for the timelapse. Defaults to 2019.
+            start_date (str, optional): Starting date (month-day) each year for filtering ImageCollection. Defaults to '06-10'.
+            end_date (str, optional): Ending date (month-day) each year for filtering ImageCollection. Defaults to '09-20'.
+            bands (list, optional): Three bands selected from ['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2', 'pixel_qa']. Defaults to ['NIR', 'Red', 'Green'].
+            vis_params (dict, optional): Visualization parameters. Defaults to None.
+            dimensions (int, optional): a number or pair of numbers in format WIDTHxHEIGHT) Maximum dimensions of the thumbnail to render, in pixels. If only one number is passed, it is used as the maximum, and the other dimension is computed by proportional scaling. Defaults to 768.
+            frames_per_second (int, optional): Animation speed. Defaults to 10.
+            font_size (int, optional): Font size of the animated text and label. Defaults to 30.
+            font_color (str, optional): Font color of the animated text and label. Defaults to 'black'.
+            add_progress_bar (bool, optional): Whether to add a progress bar at the bottom of the GIF. Defaults to True.
+            progress_bar_color (str, optional): Color for the progress bar. Defaults to 'white'.
+            progress_bar_height (int, optional): Height of the progress bar. Defaults to 5.
+            out_gif ([type], optional): File path to the output animated GIF. Defaults to None.
+
+        """
+        try:
+
+            if roi is None:
+                if self.draw_last_feature is not None:
+                    feature = self.draw_last_feature
+                    roi = feature.geometry()
+                else:
+                    roi = ee.Geometry.Polygon(
+                        [[[-115.471773, 35.892718],
+                          [-115.471773, 36.409454],
+                            [-114.271283, 36.409454],
+                            [-114.271283, 35.892718],
+                            [-115.471773, 35.892718]]], None, False)
+            elif isinstance(roi, ee.Feature) or isinstance(roi, ee.FeatureCollection):
+                roi = roi.geometry()
+            elif isinstance(roi, ee.Geometry):
+                pass
+            else:
+                print('The provided roi is invalid. It must be an ee.Geometry')
+                return
+
+            geojson = ee_to_geojson(roi)
+
+            in_gif = landsat_ts_gif(roi=roi, out_gif=out_gif, start_year=start_year, end_year=end_year, start_date=start_date,
+                                    end_date=end_date, bands=bands, vis_params=vis_params, dimensions=dimensions, frames_per_second=frames_per_second)
+
+            print('Adding animated text to GIF ...')
+            add_text_to_gif(in_gif, in_gif, xy=('2%', '2%'), text_sequence=start_year,
+                            font_size=font_size, font_color=font_color, duration=int(1000 / frames_per_second), add_progress_bar=add_progress_bar, progress_bar_color=progress_bar_color, progress_bar_height=progress_bar_height)
+
+            if label is not None:
+                add_text_to_gif(in_gif, in_gif, xy=('2%', '90%'), text_sequence=label,
+                                font_size=font_size, font_color=font_color, duration=int(1000 / frames_per_second), add_progress_bar=add_progress_bar, progress_bar_color=progress_bar_color, progress_bar_height=progress_bar_height)
+
+            bounds = minimum_bounding_box(geojson)
+            # bounds = ((35.892718, -115.471773), (36.409454, -114.271283))
+            lat = (bounds[0][0] + bounds[1][0]) / 2.0
+            lon = (bounds[0][1] + bounds[1][1]) / 2.0
+
+            print('Adding GIF to the map ...')
+
+            self.image_overlay(url=in_gif, bounds=bounds, name=layer_name)
+
+        except Exception as e:
+            print(e)
+            return
+
+    def to_html(self, outfile, title='My Map', width='100%', height='880px'):
+        """Saves the map as a HTML file.
+
+        Args:
+            outfile (str): The output file path to the HTML file.
+            title (str, optional): The title of the HTML file. Defaults to 'My Map'.
+            width (str, optional): The width of the map in pixels or percentage. Defaults to '100%'.
+            height (str, optional): The height of the map in pixels. Defaults to '880px'.
+        """
+        try:
+
+            if not outfile.endswith('.html'):
+                print('The output file must end with .html')
+                return
+
+            out_dir = os.path.dirname(outfile)
+            if not os.path.exists(out_dir):
+                os.makedirs(out_dir)
+
+            before_width = self.layout.width
+            before_height = self.layout.height
+
+            if not isinstance(width, str):
+                print("width must be a string.")
+                return
+            elif width.endswith('px') or width.endswith('%'):
+                pass
+            else:
+                print('width must end with px or %')
+                return
+
+            if not isinstance(height, str):
+                print("height must be a string.")
+                return
+            elif not height.endswith('px'):
+                print('height must end with px')
+                return
+
+            self.layout.width = width
+            self.layout.height = height
+
+            self.save(outfile, title=title)
+
+            self.layout.width = before_width
+            self.layout.height = before_height
+
+        except Exception as e:
+            print(e)
+
+    def to_image(self, outfile=None, monitor=1):
+        """Saves the map as a PNG or JPG image.
+
+        Args:
+            outfile (str, optional): The output file path to the image. Defaults to None.
+            monitor (int, optional): The monitor to take the screenshot. Defaults to 1.
+        """
+        if outfile is None:
+            outfile = os.path.join(os.getcwd(), 'my_map.png')
+
+        if outfile.endswith('.png') or outfile.endswith('.jpg'):
+            pass
+        else:
+            print('The output file must be a PNG or JPG image.')
+            return
+
+        work_dir = os.path.dirname(outfile)
+        if not os.path.exists(work_dir):
+            os.makedirs(work_dir)
+
+        screenshot = screen_capture(outfile, monitor)
+        self.screenshot = screenshot
+
+    def toolbar_reset(self):
+        """Reset the toolbar so that no tool is selected.
+        """
+        toolbar_grid = self.toolbar
+        for tool in toolbar_grid.children:
+            tool.value = False
+
+
+# The functions below are outside the Map class.
+
+def screen_capture(outfile, monitor=1):
+    """Takes a full screenshot of the selected monitor.
+
+    Args:
+        outfile (str): The output file path to the screenshot.
+        monitor (int, optional): The monitor to take the screenshot. Defaults to 1.
+    """
+    from mss import mss
+
+    out_dir = os.path.dirname(outfile)
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+
+    if not isinstance(monitor, int):
+        print('The monitor number must be an integer.')
+        return
+
+    try:
+        with mss() as sct:
+            sct.shot(output=outfile, mon=monitor)
+            return outfile
+
+    except Exception as e:
+        print(e)
+        return None
+
+
+def install_from_github(url):
+    """Install a package from a GitHub repository.
+
+    Args:
+        url (str): The URL of the GitHub repository.
+    """
+
+    try:
+        download_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
+        if not os.path.exists(download_dir):
+            os.makedirs(download_dir)
+
+        repo_name = os.path.basename(url)
+        zip_url = os.path.join(url, 'archive/master.zip')
+        filename = repo_name + '-master.zip'
+        download_from_url(url=zip_url, out_file_name=filename,
+                          out_dir=download_dir, unzip=True)
+
+        pkg_dir = os.path.join(download_dir, repo_name + '-master')
+        work_dir = os.getcwd()
+        os.chdir(pkg_dir)
+        cmd = 'pip install .'
+        os.system(cmd)
+        os.chdir(work_dir)
+
+        print("\nPlease comment out 'install_from_github()' and restart the kernel to take effect:\nJupyter menu -> Kernel -> Restart & Clear Output")
+
+    except Exception as e:
+        print(e)
 
 
 def rgb_to_hex(rgb=(255, 255, 255)):
@@ -1193,7 +1943,7 @@ def system_fonts(show_full_path=False):
         print(e)
 
 
-def add_text_to_gif(in_gif, out_gif, xy=None, text_sequence=None, font_type="arial.ttf", font_size=20, font_color='#000000', duration=100, loop=0):
+def add_text_to_gif(in_gif, out_gif, xy=None, text_sequence=None, font_type="arial.ttf", font_size=20, font_color='#000000', add_progress_bar=True, progress_bar_color='white', progress_bar_height=5, duration=100, loop=0):
     """Adds animated text to a GIF image.
 
     Args:
@@ -1204,6 +1954,9 @@ def add_text_to_gif(in_gif, out_gif, xy=None, text_sequence=None, font_type="ari
         font_type (str, optional): Font type. Defaults to "arial.ttf".
         font_size (int, optional): Font size. Defaults to 20.
         font_color (str, optional): Font color. It can be a string (e.g., 'red'), rgb tuple (e.g., (255, 127, 0)), or hex code (e.g., '#ff00ff').  Defaults to '#000000'.
+        add_progress_bar (bool, optional): Whether to add a progress bar at the bottom of the GIF. Defaults to True.
+        progress_bar_color (str, optional): Color for the progress bar. Defaults to 'white'.
+        progress_bar_height (int, optional): Height of the progress bar. Defaults to 5.
         duration (int, optional): controls how long each frame will be displayed for, in milliseconds. It is the inverse of the frame rate. Setting it to 100 milliseconds gives 10 frames per second. You can decrease the duration to give a smoother animation.. Defaults to 100.
         loop (int, optional): controls how many times the animation repeats. The default, 1, means that the animation will play once and then stop (displaying the last frame). A value of 0 means that the animation will repeat forever. Defaults to 0.
 
@@ -1245,6 +1998,7 @@ def add_text_to_gif(in_gif, out_gif, xy=None, text_sequence=None, font_type="ari
             font = ImageFont.truetype(default_font, font_size)
 
     color = check_color(font_color)
+    progress_bar_color = check_color(progress_bar_color)
 
     try:
         image = Image.open(in_gif)
@@ -1255,6 +2009,9 @@ def add_text_to_gif(in_gif, out_gif, xy=None, text_sequence=None, font_type="ari
 
     count = image.n_frames
     W, H = image.size
+    progress_bar_widths = [i * 1.0 / count * W for i in range(1, count + 1)]
+    progress_bar_shapes = [[(0, H - progress_bar_height), (x, H)]
+                           for x in progress_bar_widths]
 
     if xy is None:
         # default text location is 5% width and 5% height of the image.
@@ -1311,8 +2068,11 @@ def add_text_to_gif(in_gif, out_gif, xy=None, text_sequence=None, font_type="ari
             # Draw the text on the frame
             frame = frame.convert('RGB')
             draw = ImageDraw.Draw(frame)
-            w, h = draw.textsize(text[index])
+            # w, h = draw.textsize(text[index])
             draw.text(xy, text[index], font=font, fill=color)
+            if add_progress_bar:
+                draw.rectangle(
+                    progress_bar_shapes[index], fill=progress_bar_color)
             del draw
 
             b = io.BytesIO()
@@ -1324,12 +2084,181 @@ def add_text_to_gif(in_gif, out_gif, xy=None, text_sequence=None, font_type="ari
         # Save the frames as a new image
 
         frames[0].save(out_gif, save_all=True,
-                       append_images=frames[1:], duration=duration, loop=loop)
+                       append_images=frames[1:], duration=duration, loop=loop, optimize=True)
     except Exception as e:
         print(e)
         return
 
-    # print('The output gif with animated text was saved to {}'.format(out_gif))
+
+def open_image_from_url(url):
+    """Loads an image from the specified URL.
+
+    Args:
+        url (str): URL of the image.
+
+    Returns:
+        object: Image object.
+    """
+    from PIL import Image
+    import requests
+    from io import BytesIO
+    from urllib.parse import urlparse
+
+    try:
+
+        # if url.endswith('.gif'):
+        #     out_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
+        #     if not os.path.exists(out_dir):
+        #         os.makedirs(out_dir)
+        #     a = urlparse(url)
+        #     out_name = os.path.basename(a.path)
+        #     out_path = os.path.join(out_dir, out_name)
+        #     download_from_url(url, out_name, out_dir, unzip=False)
+        #     img =  Image.open(out_path)
+        # else:
+        response = requests.get(url)
+        img = Image.open(BytesIO(response.content))
+        return img
+    except Exception as e:
+        print(e)
+
+
+def has_transparency(img):
+    """Checks whether an image has transparency.
+
+    Args:
+        img (object):  a PIL Image object.
+
+    Returns:
+        bool: True if it has transparency, False otherwise.
+    """
+
+    if img.mode == "P":
+        transparent = img.info.get("transparency", -1)
+        for _, index in img.getcolors():
+            if index == transparent:
+                return True
+    elif img.mode == "RGBA":
+        extrema = img.getextrema()
+        if extrema[3][0] < 255:
+            return True
+
+    return False
+
+
+def add_image_to_gif(in_gif, out_gif, in_image, xy=None, image_size=(80, 80), circle_mask=False):
+    """Adds an image logo to a GIF image.
+
+    Args:
+        in_gif (str): Input file path to the GIF image.
+        out_gif (str): Output file path to the GIF image.
+        in_image (str): Input file path to the image.
+        xy (tuple, optional): Top left corner of the text. It can be formatted like this: (10, 10) or ('15%', '25%'). Defaults to None.
+        image_size (tuple, optional): Resize image. Defaults to (80, 80).
+        circle_mask (bool, optional): Whether to apply a circle mask to the image. This only works with non-png images. Defaults to False.
+    """
+    import io
+    import warnings
+    from PIL import Image, ImageDraw, ImageSequence, ImageFilter
+
+    warnings.simplefilter('ignore')
+
+    in_gif = os.path.abspath(in_gif)
+
+    is_url = False
+    if in_image.startswith('http'):
+        is_url = True
+
+    if not os.path.exists(in_gif):
+        print('The input gif file does not exist.')
+        return
+
+    if (not is_url) and (not os.path.exists(in_image)):
+        print('The provided logo file does not exist.')
+        return
+
+    if not os.path.exists(os.path.dirname(out_gif)):
+        os.makedirs(os.path.dirname(out_gif))
+
+    try:
+        image = Image.open(in_gif)
+    except Exception as e:
+        print('An error occurred while opening the image.')
+        print(e)
+        return
+
+    try:
+        if in_image.startswith('http'):
+            logo_raw_image = open_image_from_url(in_image)
+        else:
+            in_image = os.path.abspath(in_image)
+            logo_raw_image = Image.open(in_image)
+    except Exception as e:
+        print(e)
+
+    logo_raw_size = logo_raw_image.size
+    image_size = min(logo_raw_size[0], image_size[0]), min(
+        logo_raw_size[1], image_size[1])
+
+    logo_image = logo_raw_image.convert('RGBA')
+    logo_image.thumbnail(image_size, Image.ANTIALIAS)
+
+    W, H = image.size
+    mask_im = None
+
+    if circle_mask:
+        mask_im = Image.new("L", image_size, 0)
+        draw = ImageDraw.Draw(mask_im)
+        draw.ellipse((0, 0, image_size[0], image_size[1]), fill=255)
+
+    if has_transparency(logo_raw_image):
+        mask_im = logo_image.copy()
+
+    if xy is None:
+        # default logo location is 5% width and 5% height of the image.
+        xy = (int(0.05 * W), int(0.05 * H))
+    elif (xy is not None) and (not isinstance(xy, tuple)) and (len(xy) == 2):
+        print("xy must be a tuple, e.g., (10, 10), ('10%', '10%')")
+        return
+    elif all(isinstance(item, int) for item in xy) and (len(xy) == 2):
+        x, y = xy
+        if (x > 0) and (x < W) and (y > 0) and (y < H):
+            pass
+        else:
+            print(
+                'xy is out of bounds. x must be within [0, {}], and y must be within [0, {}]'.format(W, H))
+            return
+    elif all(isinstance(item, str) for item in xy) and (len(xy) == 2):
+        x, y = xy
+        if ('%' in x) and ('%' in y):
+            try:
+                x = int(float(x.replace('%', '')) / 100.0 * W)
+                y = int(float(y.replace('%', '')) / 100.0 * H)
+                xy = (x, y)
+            except Exception as e:
+                print(
+                    "The specified xy is invalid. It must be formatted like this ('10%', '10%')")
+                return
+    else:
+        print("The specified xy is invalid. It must be formatted like this: (10, 10) or ('10%', '10%')")
+        return
+
+    try:
+
+        frames = []
+        for index, frame in enumerate(ImageSequence.Iterator(image)):
+            frame = frame.convert('RGBA')
+            frame.paste(logo_image, xy, mask_im)
+
+            b = io.BytesIO()
+            frame.save(b, format="GIF")
+            frame = Image.open(b)
+            frames.append(frame)
+
+        frames[0].save(out_gif, save_all=True, append_images=frames[1:])
+    except Exception as e:
+        print(e)
+        return
 
 
 def show_image(img_path, width=None, height=None):
@@ -1454,7 +2383,7 @@ def ee_tile_layer(ee_object, vis_params={}, name='Layer untitled', shown=True, o
     elif isinstance(ee_object, ee.image.Image):
         image = ee_object
     elif isinstance(ee_object, ee.imagecollection.ImageCollection):
-        image = ee_object.median()
+        image = ee_object.mosaic()
 
     map_id_dict = ee.Image(image).getMapId(vis_params)
     tile_layer = ipyleaflet.TileLayer(
@@ -1563,6 +2492,19 @@ def open_github(subdir=None):
     webbrowser.open_new_tab(url)
 
 
+def clone_repo(out_dir='.', unzip=True):
+    """Clones the geemap GitHub repository.
+
+    Args:
+        out_dir (str, optional): Output folder for the repo. Defaults to '.'.
+        unzip (bool, optional): Whether to unzip the repository. Defaults to True.
+    """
+    url = 'https://github.com/giswqs/geemap/archive/master.zip'
+    filename = 'geemap-master.zip'
+    download_from_url(url, out_file_name=filename,
+                      out_dir=out_dir, unzip=unzip)
+
+
 def open_youtube():
     """Opens the YouTube tutorials for geemap.
     """
@@ -1583,7 +2525,7 @@ def show_youtube(id='h0pz3S6Tvx0'):
     try:
         out = widgets.Output(
             layout={'width': '815px'})
-            # layout={'border': '1px solid black', 'width': '815px'})
+        # layout={'border': '1px solid black', 'width': '815px'})
         out.clear_output(wait=True)
         display(out)
         with out:
@@ -1614,12 +2556,25 @@ def check_install(package):
 
 
 def update_package():
-    """Updates the geemap package from the geemap GitHub repository with the need to use pip or conda.
+    """Updates the geemap package from the geemap GitHub repository without the need to use pip or conda.
         In this way, I don't have to keep updating pypi and conda-forge with every minor update of the package.
+
     """
     try:
-        cmd = 'pip install --upgrade git+https://github.com/giswqs/geemap'
+        download_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
+        if not os.path.exists(download_dir):
+            os.makedirs(download_dir)
+        clone_repo(out_dir=download_dir)
+
+        pkg_dir = os.path.join(download_dir, 'geemap-master')
+        work_dir = os.getcwd()
+        os.chdir(pkg_dir)
+        cmd = 'pip install .'
         os.system(cmd)
+        os.chdir(work_dir)
+
+        print("\nPlease comment out 'geemap.update_package()' and restart the kernel to take effect:\nJupyter menu -> Kernel -> Restart & Clear Output")
+
     except Exception as e:
         print(e)
 
@@ -1906,6 +2861,16 @@ def ee_export_image(ee_object, filename, scale=None, crs=None, region=None, file
 
 
 def ee_export_image_collection(ee_object, out_dir, scale=None, crs=None, region=None, file_per_band=False):
+    """Exports an ImageCollection as GeoTIFFs.
+
+    Args:
+        ee_object (object): The ee.Image to download.
+        out_dir (str): The output directory for the exported images.
+        scale (float, optional): A default scale to use for any bands that do not specify one; ignored if crs and crs_transform is specified. Defaults to None.
+        crs (str, optional): A default CRS string to use for any bands that do not explicitly specify one. Defaults to None.
+        region (object, optional): A polygon specifying a region to download; ignored if crs and crs_transform is specified. Defaults to None.
+        file_per_band (bool, optional): Whether to produce a different GeoTIFF per band. Defaults to False.
+    """
 
     import requests
     import zipfile
@@ -1941,8 +2906,8 @@ def ee_to_numpy(ee_object, bands=None, region=None, properties=None, default_val
 
     Args:
         ee_object (object): The image to sample.
-        bands (list, optional): The list of band names to extract. Defaults to None.
-        region (object, optional): The region whose projected bounding box is used to sample the image. Defaults to the footprint in each band.
+        bands (list, optional): The list of band names to extract. Please make sure that all bands have the same spatial resolution. Defaults to None. 
+        region (object, optional): The region whose projected bounding box is used to sample the image. The maximum number of pixels you can export is 262,144. Resampling and reprojecting all bands to a fixed scale can be useful. Defaults to the footprint in each band.
         properties (list, optional): The properties to copy over from the sampled image. Defaults to all non-system properties.
         default_value (float, optional): A default value used when a sampled pixel is masked or outside a band's footprint. Defaults to None.
 
@@ -1982,13 +2947,13 @@ def ee_to_numpy(ee_object, bands=None, region=None, properties=None, default_val
 
 
 def download_ee_video(collection, video_args, out_gif):
-    """[summary]
-    
+    """Downloads a video thumbnail as a GIF image from Earth Engine.
+
     Args:
-        collection ([type]): [description]
-        video_args ([type]): [description]
-        out_gif ([type]): [description]
-    """    
+        collection (object): An ee.ImageCollection.
+        video_args ([type]): Parameters for expring the video thumbnail.
+        out_gif (str): File path to the output GIF.
+    """
     import requests
 
     out_gif = os.path.abspath(out_gif)
@@ -1999,17 +2964,31 @@ def download_ee_video(collection, video_args, out_gif):
     if not os.path.exists(os.path.dirname(out_gif)):
         os.makedirs(os.path.dirname(out_gif))
 
+    if 'region' in video_args.keys():
+        roi = video_args['region']
+
+        if not isinstance(roi, ee.Geometry):
+
+            try:
+                roi = roi.geometry()
+            except Exception as e:
+                print('Could not convert the provided roi to ee.Geometry')
+                print(e)
+                return
+
+        video_args['region'] = roi
+
     try:
         print('Generating URL...')
         url = collection.getVideoThumbURL(video_args)
 
-        print('Downloading data from {}\nPlease wait ...'.format(url))
+        print('Downloading GIF image from {}\nPlease wait ...'.format(url))
         r = requests.get(url, stream=True)
 
         if r.status_code != 200:
             print('An error occurred while downloading.')
             return
-        else: 
+        else:
             with open(out_gif, 'wb') as fd:
                 for chunk in r.iter_content(chunk_size=1024):
                     fd.write(chunk)
@@ -2231,3 +3210,1416 @@ def zonal_statistics_by_group(in_value_raster, in_zone_vector, out_file_path, st
 
     except Exception as e:
         print(e)
+
+
+def create_colorbar(width=150, height=30, palette=['blue', 'green', 'red'], add_ticks=True, add_labels=True, labels=None, vertical=False, out_file=None, font_type='arial.ttf', font_size=12, font_color='black', add_outline=True, outline_color='black'):
+    """Creates a colorbar based on the provided palette.
+
+    Args:
+        width (int, optional): Width of the colorbar in pixels. Defaults to 150.
+        height (int, optional): Height of the colorbar in pixels. Defaults to 30.
+        palette (list, optional): Palette for the colorbar. Each color can be provided as a string (e.g., 'red'), a hex string (e.g., '#ff0000'), or an RGB tuple (255, 0, 255). Defaults to ['blue', 'green', 'red'].
+        add_ticks (bool, optional): Whether to add tick markers to the colorbar. Defaults to True.
+        add_labels (bool, optional): Whether to add labels to the colorbar. Defaults to True.
+        labels (list, optional): A list of labels to add to the colorbar. Defaults to None.
+        vertical (bool, optional): Whether to rotate the colorbar vertically. Defaults to False.
+        out_file (str, optional): File path to the output colorbar in png format. Defaults to None.
+        font_type (str, optional): Font type to use for labels. Defaults to 'arial.ttf'.
+        font_size (int, optional): Font size to use for labels. Defaults to 12.
+        font_color (str, optional): Font color to use for labels. Defaults to 'black'.
+        add_outline (bool, optional): Whether to add an outline to the colorbar. Defaults to True.
+        outline_color (str, optional): Color for the outline of the colorbar. Defaults to 'black'.
+
+    Returns:
+        str: File path of the output colorbar in png format.
+
+    """
+    import decimal
+    import io
+    import pkg_resources
+    import warnings
+    from colour import Color
+    from PIL import Image, ImageDraw, ImageFont
+
+    warnings.simplefilter('ignore')
+    pkg_dir = os.path.dirname(
+        pkg_resources.resource_filename("geemap", "geemap.py"))
+
+    if out_file is None:
+        filename = 'colorbar_' + random_string() + '.png'
+        out_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
+        out_file = os.path.join(out_dir, filename)
+    elif not out_file.endswith('.png'):
+        print('The output file must end with .png')
+        return
+    else:
+        out_file = os.path.abspath(out_file)
+
+    if not os.path.exists(os.path.dirname(out_file)):
+        os.makedirs(os.path.dirname(out_file))
+
+    im = Image.new('RGBA', (width, height))
+    ld = im.load()
+
+    def float_range(start, stop, step):
+        while start < stop:
+            yield float(start)
+            start += decimal.Decimal(step)
+
+    n_colors = len(palette)
+    decimal_places = 2
+    rgb_colors = [Color(check_color(c)).rgb for c in palette]
+    keys = [round(c, decimal_places)
+            for c in list(float_range(0, 1.0001, 1.0/(n_colors - 1)))]
+
+    heatmap = []
+    for index, item in enumerate(keys):
+        pair = [item, rgb_colors[index]]
+        heatmap.append(pair)
+
+    def gaussian(x, a, b, c, d=0):
+        return a * math.exp(-(x - b)**2 / (2 * c**2)) + d
+
+    def pixel(x, width=100, map=[], spread=1):
+        width = float(width)
+        r = sum([gaussian(x, p[1][0], p[0] * width, width/(spread*len(map)))
+                 for p in map])
+        g = sum([gaussian(x, p[1][1], p[0] * width, width/(spread*len(map)))
+                 for p in map])
+        b = sum([gaussian(x, p[1][2], p[0] * width, width/(spread*len(map)))
+                 for p in map])
+        return min(1.0, r), min(1.0, g), min(1.0, b)
+
+    for x in range(im.size[0]):
+        r, g, b = pixel(x, width=width, map=heatmap)
+        r, g, b = [int(256*v) for v in (r, g, b)]
+        for y in range(im.size[1]):
+            ld[x, y] = r, g, b
+
+    if add_outline:
+        draw = ImageDraw.Draw(im)
+        draw.rectangle([(0, 0), (width-1, height-1)],
+                       outline=check_color(outline_color))
+        del draw
+
+    if add_ticks:
+        tick_length = height * 0.1
+        x = [key * width for key in keys]
+        y_top = height - tick_length
+        y_bottom = height
+        draw = ImageDraw.Draw(im)
+        for i in x:
+            shape = [(i, y_top), (i, y_bottom)]
+            draw.line(shape, fill='black', width=0)
+        del draw
+
+    if vertical:
+        im = im.transpose(Image.ROTATE_90)
+
+    width, height = im.size
+
+    if labels is None:
+        labels = [str(c) for c in keys]
+    elif len(labels) == 2:
+        try:
+            lowerbound = float(labels[0])
+            upperbound = float(labels[1])
+            step = (upperbound - lowerbound) / (len(palette) - 1)
+            labels = [str(lowerbound + c * step)
+                      for c in range(0, len(palette))]
+        except Exception as e:
+            print(e)
+            print('The labels are invalid.')
+            return
+    elif len(labels) == len(palette):
+        labels = [str(c) for c in labels]
+    else:
+        print('The labels must have the same length as the palette.')
+        return
+
+    if add_labels:
+
+        default_font = os.path.join(pkg_dir, 'data/fonts/arial.ttf')
+        if font_type == 'arial.ttf':
+            font = ImageFont.truetype(default_font, font_size)
+        else:
+            try:
+                font_list = system_fonts(show_full_path=True)
+                font_names = [os.path.basename(f) for f in font_list]
+                if (font_type in font_list) or (font_type in font_names):
+                    font = ImageFont.truetype(font_type, font_size)
+                else:
+                    print(
+                        'The specified font type could not be found on your system. Using the default font instead.')
+                    font = ImageFont.truetype(default_font, font_size)
+            except Exception as e:
+                print(e)
+                font = ImageFont.truetype(default_font, font_size)
+
+        font_color = check_color(font_color)
+
+        draw = ImageDraw.Draw(im)
+        w, h = draw.textsize(labels[0], font=font)
+
+        for label in labels:
+            w_tmp, h_tmp = draw.textsize(label, font)
+            if w_tmp > w:
+                w = w_tmp
+            if h_tmp > h:
+                h = h_tmp
+
+        W, H = width + w * 2, height + h * 2
+        background = Image.new('RGBA', (W, H))
+        draw = ImageDraw.Draw(background)
+
+        if vertical:
+            xy = (0, h)
+        else:
+            xy = (w, 0)
+        background.paste(im, xy, im)
+
+        for index, label in enumerate(labels):
+
+            w_tmp, h_tmp = draw.textsize(label, font)
+
+            if vertical:
+                spacing = 5
+                x = width + spacing
+                y = int(height + h - keys[index] * height - h_tmp / 2 - 1)
+                draw.text((x, y), label, font=font, fill=font_color)
+
+            else:
+                x = int(keys[index] * width + w - w_tmp / 2)
+                spacing = int(h * 0.05)
+                y = height + spacing
+                draw.text((x, y), label, font=font, fill=font_color)
+
+        im = background.copy()
+
+    im.save(out_file)
+    return out_file
+
+
+def naip_timeseries(roi=None, start_year=2009, end_year=2018):
+    """Creates NAIP annual timeseries
+
+    Args:
+        roi (object, optional): An ee.Geometry representing the region of interest. Defaults to None.
+        start_year (int, optional): Starting year for the timeseries. Defaults to2009.
+        end_year (int, optional): Ending year for the timeseries. Defaults to 2018.
+
+    Returns:
+        object: An ee.ImageCollection representing annual NAIP imagery.
+    """
+    ee_initialize()
+    try:
+
+        def get_annual_NAIP(year):
+            try:
+                collection = ee.ImageCollection('USDA/NAIP/DOQQ')
+                if roi is not None:
+                    collection = collection.filterBounds(roi)
+                start_date = ee.Date.fromYMD(year, 1, 1)
+                end_date = ee.Date.fromYMD(year, 12, 31)
+                naip = collection.filterDate(start_date, end_date) \
+                    .filter(ee.Filter.listContains("system:band_names", "N"))
+                naip = ee.Image(ee.ImageCollection(naip).mosaic())
+                return naip
+            except Exception as e:
+                print(e)
+
+        years = ee.List.sequence(start_year, end_year)
+        collection = years.map(get_annual_NAIP)
+        return collection
+
+    except Exception as e:
+        print(e)
+
+
+def sentinel2_timeseries(roi=None, start_year=2015, end_year=2019, start_date='01-01', end_date='12-31'):
+    """Generates an annual Sentinel 2 ImageCollection. This algorithm is adapted from https://gist.github.com/jdbcode/76b9ac49faf51627ebd3ff988e10adbc. A huge thank you to Justin Braaten for sharing his fantastic work.
+       Images include both level 1C and level 2A imagery.
+    Args:
+
+        roi (object, optional): Region of interest to create the timelapse. Defaults to None.
+        start_year (int, optional): Starting year for the timelapse. Defaults to 2015.
+        end_year (int, optional): Ending year for the timelapse. Defaults to 2019.
+        start_date (str, optional): Starting date (month-day) each year for filtering ImageCollection. Defaults to '01-01'.
+        end_date (str, optional): Ending date (month-day) each year for filtering ImageCollection. Defaults to '12-31'.
+    Returns:
+        object: Returns an ImageCollection containing annual Sentinel 2 images.
+    """
+
+    ################################################################################
+
+    ################################################################################
+    # Input and output parameters.
+    import re
+    import datetime
+
+    ee_initialize()
+
+    if roi is None:
+        # roi = ee.Geometry.Polygon(
+        #     [[[-180, -80],
+        #       [-180, 80],
+        #         [180, 80],
+        #         [180, -80],
+        #         [-180, -80]]], None, False)
+        roi = ee.Geometry.Polygon(
+            [[[-115.471773, 35.892718],
+              [-115.471773, 36.409454],
+                [-114.271283, 36.409454],
+                [-114.271283, 35.892718],
+                [-115.471773, 35.892718]]], None, False)
+
+    if not isinstance(roi, ee.Geometry):
+
+        try:
+            roi = roi.geometry()
+        except Exception as e:
+            print('Could not convert the provided roi to ee.Geometry')
+            print(e)
+            return
+
+    ################################################################################
+    # Setup vars to get dates.
+    if isinstance(start_year, int) and (start_year >= 2015) and (start_year <= 2020):
+        pass
+    else:
+        print('The start year must be an integer >= 2015.')
+        return
+
+    if isinstance(end_year, int) and (end_year >= 2015) and (end_year <= 2020):
+        pass
+    else:
+        print('The end year must be an integer <= 2020.')
+        return
+
+    if re.match("[0-9]{2}\-[0-9]{2}", start_date) and re.match("[0-9]{2}\-[0-9]{2}", end_date):
+        pass
+    else:
+        print('The start data and end date must be month-day, such as 06-10, 09-20')
+        return
+
+    try:
+        datetime.datetime(int(start_year), int(
+            start_date[:2]), int(start_date[3:5]))
+        datetime.datetime(int(end_year), int(end_date[:2]), int(end_date[3:5]))
+    except Exception as e:
+        print('The input dates are invalid.')
+        print(e)
+        return
+
+    try:
+        start_test = datetime.datetime(int(start_year), int(
+            start_date[:2]), int(start_date[3:5]))
+        end_test = datetime.datetime(
+            int(end_year), int(end_date[:2]), int(end_date[3:5]))
+        if start_test > end_test:
+            raise ValueError('Start date must be prior to end date')
+    except Exception as e:
+        print(e)
+        return
+
+    def days_between(d1, d2):
+        d1 = datetime.datetime.strptime(d1, "%Y-%m-%d")
+        d2 = datetime.datetime.strptime(d2, "%Y-%m-%d")
+        return abs((d2 - d1).days)
+
+    n_days = days_between(str(start_year) + '-' + start_date,
+                          str(start_year) + '-' + end_date)
+    start_month = int(start_date[:2])
+    start_day = int(start_date[3:5])
+    start_date = str(start_year) + '-' + start_date
+    end_date = str(end_year) + '-' + end_date
+
+    # Define a collection filter by date, bounds, and quality.
+    def colFilter(col, aoi):  # , startDate, endDate):
+        return(col.filterBounds(aoi))
+
+    # Get Sentinel 2 collections, both Level-1C (top of atmophere) and Level-2A (surface reflectance)
+    MSILCcol = ee.ImageCollection('COPERNICUS/S2')
+    MSI2Acol = ee.ImageCollection('COPERNICUS/S2_SR')
+
+    # Define a collection filter by date, bounds, and quality.
+    def colFilter(col, roi, start_date, end_date):
+        return(col
+               .filterBounds(roi)
+               .filterDate(start_date, end_date))
+        # .filter('CLOUD_COVER < 5')
+        # .filter('GEOMETRIC_RMSE_MODEL < 15')
+        # .filter('IMAGE_QUALITY == 9 || IMAGE_QUALITY_OLI == 9'))
+
+    # Function to get and rename bands of interest from MSI
+    def renameMSI(img):
+        return(img.select(
+            ['B2', 'B3', 'B4', 'B5', 'B6', 'B7',
+                'B8', 'B8A', 'B11', 'B12', 'QA60'],
+            ['Blue', 'Green', 'Red', 'Red Edge 1', 'Red Edge 2', 'Red Edge 3', 'NIR', 'Red Edge 4', 'SWIR1', 'SWIR2', 'QA60']))
+
+    # Add NBR for LandTrendr segmentation.
+
+    def calcNbr(img):
+        return(img.addBands(img.normalizedDifference(['NIR', 'SWIR2'])
+                            .multiply(-10000).rename('NBR')).int16())
+
+    # Define function to mask out clouds and cloud shadows in images.
+    # Use CFmask band included in USGS Landsat SR image product.
+
+    def fmask(img):
+        cloudOpaqueBitMask = 1 << 10
+        cloudCirrusBitMask = 1 << 11
+        qa = img.select('QA60')
+        mask = qa.bitwiseAnd(cloudOpaqueBitMask).eq(0) \
+            .And(qa.bitwiseAnd(cloudCirrusBitMask).eq(0))
+        return(img.updateMask(mask))
+
+    # Define function to prepare MSI images.
+    def prepMSI(img):
+        orig = img
+        img = renameMSI(img)
+        img = fmask(img)
+        return(ee.Image(img.copyProperties(orig, orig.propertyNames()))
+               .resample('bicubic'))
+
+    # Get annual median collection.
+    def getAnnualComp(y):
+        startDate = ee.Date.fromYMD(
+            ee.Number(y), ee.Number(start_month), ee.Number(start_day))
+        endDate = startDate.advance(ee.Number(n_days), 'day')
+
+        # Filter collections and prepare them for merging.
+        MSILCcoly = colFilter(MSILCcol, roi, startDate, endDate).map(prepMSI)
+        MSI2Acoly = colFilter(MSI2Acol, roi, startDate, endDate).map(prepMSI)
+
+        # Merge the collections.
+        col = MSILCcoly.merge(MSI2Acoly)
+
+        yearImg = col.median()
+        nBands = yearImg.bandNames().size()
+        yearImg = ee.Image(ee.Algorithms.If(
+            nBands,
+            yearImg,
+            dummyImg))
+        return(calcNbr(yearImg)
+               .set({'year': y, 'system:time_start': startDate.millis(), 'nBands': nBands}))
+
+    ################################################################################
+
+    # Make a dummy image for missing years.
+    bandNames = ee.List(['Blue', 'Green', 'Red', 'Red Edge 1',
+                         'Red Edge 2', 'Red Edge 3', 'NIR',
+                         'Red Edge 4', 'SWIR1', 'SWIR2', 'QA60'])
+    fillerValues = ee.List.repeat(0, bandNames.size())
+    dummyImg = ee.Image.constant(fillerValues).rename(bandNames) \
+        .selfMask().int16()
+
+    ################################################################################
+    # Get a list of years
+    years = ee.List.sequence(start_year, end_year)
+
+    ################################################################################
+    # Make list of annual image composites.
+    imgList = years.map(getAnnualComp)
+
+    # Convert image composite list to collection
+    imgCol = ee.ImageCollection.fromImages(imgList)
+
+    imgCol = imgCol.map(lambda img: img.clip(roi))
+
+    return imgCol
+
+
+def landsat_timeseries(roi=None, start_year=1984, end_year=2019, start_date='06-10', end_date='09-20'):
+    """Generates an annual Landsat ImageCollection. This algorithm is adapted from https://gist.github.com/jdbcode/76b9ac49faf51627ebd3ff988e10adbc. A huge thank you to Justin Braaten for sharing his fantastic work.
+
+    Args:
+        roi ([type], optional): [description]. Defaults to None.
+        start_year (int, optional): [description]. Defaults to 1984.
+        end_year (int, optional): [description]. Defaults to 2019.
+        start_date (str, optional): [description]. Defaults to '06-10'.
+        end_date (str, optional): [description]. Defaults to '09-20'.
+
+        roi (object, optional): Region of interest to create the timelapse. Defaults to None.
+        start_year (int, optional): Starting year for the timelapse. Defaults to 1984.
+        end_year (int, optional): Ending year for the timelapse. Defaults to 2019.
+        start_date (str, optional): Starting date (month-day) each year for filtering ImageCollection. Defaults to '06-10'.
+        end_date (str, optional): Ending date (month-day) each year for filtering ImageCollection. Defaults to '09-20'.
+    Returns:
+        object: Returns an ImageCollection containing annual Landsat images.
+    """
+
+    ################################################################################
+    # Input and output parameters.
+    import re
+    import datetime
+
+    ee_initialize()
+
+    if roi is None:
+        # roi = ee.Geometry.Polygon(
+        #     [[[-180, -80],
+        #       [-180, 80],
+        #         [180, 80],
+        #         [180, -80],
+        #         [-180, -80]]], None, False)
+        roi = ee.Geometry.Polygon(
+            [[[-115.471773, 35.892718],
+              [-115.471773, 36.409454],
+                [-114.271283, 36.409454],
+                [-114.271283, 35.892718],
+                [-115.471773, 35.892718]]], None, False)
+
+    if not isinstance(roi, ee.Geometry):
+
+        try:
+            roi = roi.geometry()
+        except Exception as e:
+            print('Could not convert the provided roi to ee.Geometry')
+            print(e)
+            return
+
+    ################################################################################
+
+    # Setup vars to get dates.
+    if isinstance(start_year, int) and (start_year >= 1984) and (start_year < 2020):
+        pass
+    else:
+        print('The start year must be an integer >= 1984.')
+        return
+
+    if isinstance(end_year, int) and (end_year > 1984) and (end_year <= 2020):
+        pass
+    else:
+        print('The end year must be an integer <= 2020.')
+        return
+
+    if re.match("[0-9]{2}\-[0-9]{2}", start_date) and re.match("[0-9]{2}\-[0-9]{2}", end_date):
+        pass
+    else:
+        print('The start date and end date must be month-day, such as 06-10, 09-20')
+        return
+
+    try:
+        datetime.datetime(int(start_year), int(
+            start_date[:2]), int(start_date[3:5]))
+        datetime.datetime(int(end_year), int(end_date[:2]), int(end_date[3:5]))
+    except Exception as e:
+        print('The input dates are invalid.')
+        return
+
+    def days_between(d1, d2):
+        d1 = datetime.datetime.strptime(d1, "%Y-%m-%d")
+        d2 = datetime.datetime.strptime(d2, "%Y-%m-%d")
+        return abs((d2 - d1).days)
+
+    n_days = days_between(str(start_year) + '-' + start_date,
+                          str(start_year) + '-' + end_date)
+    start_month = int(start_date[:2])
+    start_day = int(start_date[3:5])
+    start_date = str(start_year) + '-' + start_date
+    end_date = str(end_year) + '-' + end_date
+
+    # Define a collection filter by date, bounds, and quality.
+    def colFilter(col, aoi):  # , startDate, endDate):
+        return(col.filterBounds(aoi))
+
+    # Landsat collection preprocessingEnabled
+    # Get Landsat surface reflectance collections for OLI, ETM+ and TM sensors.
+    LC08col = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')
+    LE07col = ee.ImageCollection('LANDSAT/LE07/C01/T1_SR')
+    LT05col = ee.ImageCollection('LANDSAT/LT05/C01/T1_SR')
+    LT04col = ee.ImageCollection('LANDSAT/LT04/C01/T1_SR')
+
+    # Define a collection filter by date, bounds, and quality.
+    def colFilter(col, roi, start_date, end_date):
+        return(col
+               .filterBounds(roi)
+               .filterDate(start_date, end_date))
+        # .filter('CLOUD_COVER < 5')
+        # .filter('GEOMETRIC_RMSE_MODEL < 15')
+        # .filter('IMAGE_QUALITY == 9 || IMAGE_QUALITY_OLI == 9'))
+
+    # Function to get and rename bands of interest from OLI.
+    def renameOli(img):
+        return(img.select(
+            ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'pixel_qa'],
+            ['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2', 'pixel_qa']))
+
+    # Function to get and rename bands of interest from ETM+.
+    def renameEtm(img):
+        return(img.select(
+            ['B1', 'B2', 'B3', 'B4', 'B5', 'B7', 'pixel_qa'],
+            ['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2', 'pixel_qa']))
+
+    # Add NBR for LandTrendr segmentation.
+    def calcNbr(img):
+        return(img.addBands(img.normalizedDifference(['NIR', 'SWIR2'])
+                            .multiply(-10000).rename('NBR')).int16())
+
+    # Define function to mask out clouds and cloud shadows in images.
+    # Use CFmask band included in USGS Landsat SR image product.
+    def fmask(img):
+        cloudShadowBitMask = 1 << 3
+        cloudsBitMask = 1 << 5
+        qa = img.select('pixel_qa')
+        mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0) \
+            .And(qa.bitwiseAnd(cloudsBitMask).eq(0))
+        return(img.updateMask(mask))
+
+    # Define function to prepare OLI images.
+    def prepOli(img):
+        orig = img
+        img = renameOli(img)
+        img = fmask(img)
+        return (ee.Image(img.copyProperties(orig, orig.propertyNames()))
+                .resample('bicubic'))
+
+    # Define function to prepare ETM+ images.
+    def prepEtm(img):
+        orig = img
+        img = renameEtm(img)
+        img = fmask(img)
+        return(ee.Image(img.copyProperties(orig, orig.propertyNames()))
+               .resample('bicubic'))
+
+    # Get annual median collection.
+    def getAnnualComp(y):
+        startDate = ee.Date.fromYMD(
+            ee.Number(y), ee.Number(start_month), ee.Number(start_day))
+        endDate = startDate.advance(ee.Number(n_days), 'day')
+
+        # Filter collections and prepare them for merging.
+        LC08coly = colFilter(LC08col, roi, startDate, endDate).map(prepOli)
+        LE07coly = colFilter(LE07col, roi, startDate, endDate).map(prepEtm)
+        LT05coly = colFilter(LT05col, roi, startDate, endDate).map(prepEtm)
+        LT04coly = colFilter(LT04col, roi, startDate, endDate).map(prepEtm)
+
+        # Merge the collections.
+        col = LC08coly.merge(LE07coly).merge(LT05coly).merge(LT04coly)
+
+        yearImg = col.median()
+        nBands = yearImg.bandNames().size()
+        yearImg = ee.Image(ee.Algorithms.If(
+            nBands,
+            yearImg,
+            dummyImg))
+        return(calcNbr(yearImg)
+               .set({'year': y, 'system:time_start': startDate.millis(), 'nBands': nBands}))
+
+    ################################################################################
+
+    # Make a dummy image for missing years.
+    bandNames = ee.List(['Blue', 'Green', 'Red', 'NIR',
+                         'SWIR1', 'SWIR2', 'pixel_qa'])
+    fillerValues = ee.List.repeat(0, bandNames.size())
+    dummyImg = ee.Image.constant(fillerValues).rename(bandNames) \
+        .selfMask().int16()
+
+    ################################################################################
+    # Get a list of years
+    years = ee.List.sequence(start_year, end_year)
+
+    ################################################################################
+    # Make list of annual image composites.
+    imgList = years.map(getAnnualComp)
+
+    # Convert image composite list to collection
+    imgCol = ee.ImageCollection.fromImages(imgList)
+
+    imgCol = imgCol.map(lambda img: img.clip(roi))
+
+    return imgCol
+
+    # ################################################################################
+    # # Run LandTrendr.
+    # lt = ee.Algorithms.TemporalSegmentation.LandTrendr(
+    #     timeSeries=imgCol.select(['NBR', 'SWIR1', 'NIR', 'Green']),
+    #     maxSegments=10,
+    #     spikeThreshold=0.7,
+    #     vertexCountOvershoot=3,
+    #     preventOneYearRecovery=True,
+    #     recoveryThreshold=0.5,
+    #     pvalThreshold=0.05,
+    #     bestModelProportion=0.75,
+    #     minObservationsNeeded=6)
+
+    # ################################################################################
+    # # Get fitted imagery. This starts export tasks.
+    # def getYearStr(year):
+    #     return(ee.String('yr_').cat(ee.Algorithms.String(year).slice(0,4)))
+
+    # yearsStr = years.map(getYearStr)
+
+    # r = lt.select(['SWIR1_fit']).arrayFlatten([yearsStr]).toShort()
+    # g = lt.select(['NIR_fit']).arrayFlatten([yearsStr]).toShort()
+    # b = lt.select(['Green_fit']).arrayFlatten([yearsStr]).toShort()
+
+    # for i, c in zip([r, g, b], ['r', 'g', 'b']):
+    #     descr = 'mamore-river-'+c
+    #     name = 'users/user/'+descr
+    #     print(name)
+    #     task = ee.batch.Export.image.toAsset(
+    #     image=i,
+    #     region=roi.getInfo()['coordinates'],
+    #     assetId=name,
+    #     description=descr,
+    #     scale=30,
+    #     crs='EPSG:3857',
+    #     maxPixels=1e13)
+    #     task.start()
+
+
+def landsat_ts_gif(roi=None, out_gif=None, start_year=1984, end_year=2019, start_date='06-10', end_date='09-20', bands=['NIR', 'Red', 'Green'], vis_params=None, dimensions=768, frames_per_second=10):
+    """Generates a Landsat timelapse GIF image. This function is adapted from https://emaprlab.users.earthengine.app/view/lt-gee-time-series-animator. A huge thank you to Justin Braaten for sharing his fantastic work.
+
+    Args:
+        roi (object, optional): Region of interest to create the timelapse. Defaults to None.
+        out_gif ([type], optional): File path to the output animated GIF. Defaults to None.
+        start_year (int, optional): Starting year for the timelapse. Defaults to 1984.
+        end_year (int, optional): Ending year for the timelapse. Defaults to 2019.
+        start_date (str, optional): Starting date (month-day) each year for filtering ImageCollection. Defaults to '06-10'.
+        end_date (str, optional): Ending date (month-day) each year for filtering ImageCollection. Defaults to '09-20'.
+        bands (list, optional): Three bands selected from ['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2', 'pixel_qa']. Defaults to ['NIR', 'Red', 'Green'].
+        vis_params (dict, optional): Visualization parameters. Defaults to None.
+        dimensions (int, optional): a number or pair of numbers in format WIDTHxHEIGHT) Maximum dimensions of the thumbnail to render, in pixels. If only one number is passed, it is used as the maximum, and the other dimension is computed by proportional scaling. Defaults to 768.
+        frames_per_second (int, optional): Animation speed. Defaults to 10.
+
+    Returns:
+        str: File path to the output GIF image.
+    """
+
+    ee_initialize()
+
+    if roi is None:
+        roi = ee.Geometry.Polygon(
+            [[[-115.471773, 35.892718],
+              [-115.471773, 36.409454],
+                [-114.271283, 36.409454],
+                [-114.271283, 35.892718],
+                [-115.471773, 35.892718]]], None, False)
+    elif isinstance(roi, ee.Feature) or isinstance(roi, ee.FeatureCollection):
+        roi = roi.geometry()
+    elif isinstance(roi, ee.Geometry):
+        pass
+    else:
+        print('The provided roi is invalid. It must be an ee.Geometry')
+        return
+
+    if out_gif is None:
+        out_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
+        filename = 'landsat_ts_' + random_string() + '.gif'
+        out_gif = os.path.join(out_dir, filename)
+    elif not out_gif.endswith('.gif'):
+        print('The output file must end with .gif')
+        return
+    elif not os.path.isfile(out_gif):
+        print('The output file must be a file')
+        return
+    else:
+        out_gif = os.path.abspath(out_gif)
+        out_dir = os.path.dirname(out_gif)
+
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+
+    allowed_bands = ['Blue', 'Green', 'Red',
+                     'NIR', 'SWIR1', 'SWIR2', 'pixel_qa']
+
+    if len(bands) == 3 and all(x in allowed_bands for x in bands):
+        pass
+    else:
+        print('You can only select 3 bands from the following: {}'.format(
+            ', '.join(allowed_bands)))
+        return
+
+    try:
+        col = landsat_timeseries(
+            roi, start_year, end_year, start_date, end_date)
+
+        if vis_params is None:
+            vis_params = {}
+            vis_params['bands'] = bands
+            vis_params['min'] = 0
+            vis_params['max'] = 4000
+            vis_params['gamma'] = [1, 1, 1]
+
+        video_args = vis_params.copy()
+        video_args['dimensions'] = dimensions
+        video_args['region'] = roi
+        video_args['framesPerSecond'] = frames_per_second
+        video_args['crs'] = 'EPSG:3857'
+
+        if 'bands' not in video_args.keys():
+            video_args['bands'] = bands
+
+        if 'min' not in video_args.keys():
+            video_args['min'] = 0
+
+        if 'max' not in video_args.keys():
+            video_args['max'] = 4000
+
+        if 'gamma' not in video_args.keys():
+            video_args['gamma'] = [1, 1, 1]
+
+        download_ee_video(col, video_args, out_gif)
+
+        return out_gif
+
+    except Exception as e:
+        print(e)
+        return
+
+
+def minimum_bounding_box(geojson):
+    """Gets the minimum bounding box for a geojson polygon.
+
+    Args:
+        geojson (dict): A geojson dictionary.
+
+    Returns:
+        tuple: Returns a tuple containing the minimum bounding box in the format of (lower_left(lat, lon), upper_right(lat, lon)), such as ((13, -130), (32, -120)).
+    """
+    coordinates = []
+    try:
+        if 'geometry' in geojson.keys():
+            coordinates = geojson['geometry']['coordinates'][0]
+        else:
+            coordinates = geojson['coordinates'][0]
+
+        lower_left = min([x[1] for x in coordinates]), min(
+            [x[0] for x in coordinates])  # (lat, lon)
+        upper_right = max([x[1] for x in coordinates]), max([x[0]
+                                                             for x in coordinates])  # (lat, lon)
+        bounds = (lower_left, upper_right)
+        return bounds
+    except Exception as e:
+        print(e)
+        return
+
+
+def geocode(location, max_rows=10, reverse=False):
+    """Search location by address and lat/lon coordinates.
+
+    Args:
+        location (str): Place name or address
+        max_rows (int, optional): Maximum number of records to return. Defaults to 10.
+        reverse (bool, optional): Search place based on coordinates. Defaults to False.
+
+    Returns:
+        list: Returns a list of locations.
+    """
+    if not isinstance(location, str):
+        print('The location must be a string.')
+        return None
+
+    if not reverse:
+
+        locations = []
+        addresses = set()
+        g = geocoder.arcgis(location, maxRows=max_rows)
+
+        for result in g:
+            address = result.address
+            if not address in addresses:
+                addresses.add(address)
+                locations.append(result)
+
+        if len(locations) > 0:
+            return locations
+        else:
+            return None
+
+    else:
+        try:
+            if ',' in location:
+                latlon = [float(x) for x in location.split(',')]
+            elif ' ' in location:
+                latlon = [float(x) for x in location.split(' ')]
+            else:
+                print(
+                    'The lat-lon coordinates should be numbers only and separated by comma or space, such as 40.2, -100.3')
+                return
+            g = geocoder.arcgis(latlon, method='reverse')
+            locations = []
+            addresses = set()
+
+            for result in g:
+                address = result.address
+                if not address in addresses:
+                    addresses.add(address)
+                    locations.append(result)
+
+            if len(locations) > 0:
+                return locations
+            else:
+                return None
+
+        except Exception as e:
+            print(e)
+            return None
+
+
+def is_latlon_valid(location):
+    """Checks whether a pair of coordinates is valid.
+
+    Args:
+        location (str): A pair of latlon coordinates separated by comma or space.
+
+    Returns:
+        bool: Returns True if valid.
+    """
+    latlon = []
+    if ',' in location:
+        latlon = [float(x) for x in location.split(',')]
+    elif ' ' in location:
+        latlon = [float(x) for x in location.split(' ')]
+    else:
+        print(
+            'The coordinates should be numbers only and separated by comma or space, such as 40.2, -100.3')
+        return False
+
+    try:
+        lat, lon = float(latlon[0]), float(latlon[1])
+        if lat >= -90 and lat <= 90 and lon >= -180 and lat <= 180:
+            return True
+        else:
+            return False
+    except Exception as e:
+        print(e)
+        return False
+
+
+def latlon_from_text(location):
+    """Extracts latlon from text.
+
+    Args:
+        location (str): A pair of latlon coordinates separated by comma or space.
+
+    Returns:
+        bool: Returns (lat, lon) if valid.
+    """
+    latlon = []
+    try:
+        if ',' in location:
+            latlon = [float(x) for x in location.split(',')]
+        elif ' ' in location:
+            latlon = [float(x) for x in location.split(' ')]
+        else:
+            print(
+                'The lat-lon coordinates should be numbers only and separated by comma or space, such as 40.2, -100.3')
+            return None
+
+        lat, lon = latlon[0], latlon[1]
+        if lat >= -90 and lat <= 90 and lon >= -180 and lat <= 180:
+            return lat, lon
+        else:
+            return None
+
+    except Exception as e:
+        print(e)
+        print('The lat-lon coordinates should be numbers only and separated by comma or space, such as 40.2, -100.3')
+        return None
+
+
+def search_ee_data(keywords):
+    """Searches Earth Engine data catalog.
+
+    Args:
+        keywords (str): Keywords to search for can be id, provider, tag and so on
+
+    Returns:
+        list: Returns a lit of assets.
+    """
+    try:
+        cmd = 'geeadd search --keywords "{}"'.format(str(keywords))
+        output = os.popen(cmd).read()
+        start_index = output.index('[')
+        assets = eval(output[start_index:])
+
+        results = []
+        for asset in assets:
+            asset_dates = asset['start_date'] + ' - ' + asset['end_date']
+            asset_snippet = asset['ee_id_snippet']
+            start_index = asset_snippet.index("'") + 1
+            end_index = asset_snippet.index("'", start_index)
+            asset_id = asset_snippet[start_index:end_index]
+
+            asset['dates'] = asset_dates
+            asset['id'] = asset_id
+            asset['uid'] = asset_id.replace('/', '_')
+            # asset['url'] = 'https://developers.google.com/earth-engine/datasets/catalog/' + asset['uid']
+            # asset['thumbnail'] = 'https://mw1.google.com/ges/dd/images/{}_sample.png'.format(
+            #     asset['uid'])
+            results.append(asset)
+
+        return results
+
+    except Exception as e:
+        print(e)
+        return
+
+
+def ee_data_thumbnail(asset_id):
+    """Retrieves the thumbnail URL of an Earth Engine asset.
+
+    Args:
+        asset_id (str): An Earth Engine asset id.
+
+    Returns:
+        str: An http url of the thumbnail.
+    """
+    import requests
+    import urllib
+    from bs4 import BeautifulSoup
+
+    asset_uid = asset_id.replace('/', '_')
+    asset_url = "https://developers.google.com/earth-engine/datasets/catalog/{}".format(
+        asset_uid)
+    thumbnail_url = 'https://mw1.google.com/ges/dd/images/{}_sample.png'.format(
+        asset_uid)
+
+    r = requests.get(thumbnail_url)
+
+    try:
+        if r.status_code != 200:
+            html_page = urllib.request.urlopen(asset_url)
+            soup = BeautifulSoup(html_page, features="html.parser")
+
+            for img in soup.findAll('img'):
+                if 'sample.png' in img.get('src'):
+                    thumbnail_url = img.get('src')
+                    return thumbnail_url
+
+        return thumbnail_url
+    except Exception as e:
+        print(e)
+        return
+
+
+def ee_data_html(asset):
+    """Generates HTML from an asset to be used in the HTML widget.
+
+    Args:
+        asset (dict): A dictionary containing an Earth Engine asset.
+
+    Returns:
+        str: A string containing HTML.
+    """
+    template = '''
+        <html>
+        <body>
+            <h3>asset_title</h3>
+            <h4>Dataset Availability</h4>
+                <p style="margin-left: 40px">asset_dates</p>
+            <h4>Earth Engine Snippet</h4>
+                <p style="margin-left: 40px">ee_id_snippet</p>
+            <h4>Earth Engine Data Catalog</h4>
+                <p style="margin-left: 40px"><a href="asset_url" target="_blank">asset_id</a></p>
+            <h4>Dataset Thumbnail</h4>
+                <img src="thumbnail_url">
+        </body>
+        </html>
+    '''
+
+    try:
+
+        text = template.replace('asset_title', asset['title'])
+        text = text.replace('asset_dates', asset['dates'])
+        text = text.replace('ee_id_snippet', asset['ee_id_snippet'])
+        text = text.replace('asset_id', asset['id'])
+        text = text.replace('asset_url', asset['asset_url'])
+        # asset['thumbnail'] = ee_data_thumbnail(asset['id'])
+        text = text.replace('thumbnail_url', asset['thumbnail_url'])
+
+        return text
+
+    except Exception as e:
+        print(e)
+        return
+
+
+def create_code_cell(code='', where='below'):
+    """Creates a code cell in the IPython Notebook.
+
+    Args:
+        code (str, optional): Code to fill the new code cell with. Defaults to ''.
+        where (str, optional): Where to add the new code cell. It can be one of the following: above, below, at_bottom. Defaults to 'below'.
+    """
+
+    import base64
+    from IPython.display import Javascript, display
+    encoded_code = (base64.b64encode(str.encode(code))).decode()
+    display(Javascript("""
+        var code = IPython.notebook.insert_cell_{0}('code');
+        code.set_text(atob("{1}"));
+    """.format(where, encoded_code)))
+
+
+def ee_api_to_csv(outfile=None):
+    """Extracts Earth Engine API documentation from https://developers.google.com/earth-engine/api_docs as a csv file.
+
+    Args:
+        outfile (str, optional): The output file path to a csv file. Defaults to None.
+    """
+    import csv
+    import requests
+    from bs4 import BeautifulSoup
+
+    pkg_dir = os.path.dirname(
+        pkg_resources.resource_filename("geemap", "geemap.py"))
+    data_dir = os.path.join(pkg_dir, 'data')
+    template_dir = os.path.join(data_dir, 'template')
+    csv_file = os.path.join(template_dir, 'ee_api_docs.csv')
+
+    if outfile is None:
+        outfile = csv_file
+    else:
+        if not outfile.endswith('.csv'):
+            print('The output file must end with .csv')
+            return
+        else:
+            out_dir = os.path.dirname(outfile)
+            if not os.path.exists(out_dir):
+                os.makedirs(out_dir)
+
+    url = 'https://developers.google.com/earth-engine/api_docs'
+
+    try:
+
+        r = requests.get(url)
+        soup = BeautifulSoup(r.content, 'html.parser')
+
+        names = []
+        descriptions = []
+        functions = []
+        returns = []
+        arguments = []
+        types = []
+        details = []
+
+        names = [h2.text for h2 in soup.find_all('h2')]
+        descriptions = [
+            h2.next_sibling.next_sibling.text for h2 in soup.find_all('h2')]
+        func_tables = soup.find_all('table', class_='blue')
+        functions = [func_table.find(
+            'code').text for func_table in func_tables]
+        returns = [func_table.find_all(
+            'td')[1].text for func_table in func_tables]
+
+        detail_tables = []
+        tables = soup.find_all('table', class_='blue')
+
+        for table in tables:
+            item = table.next_sibling
+            if item.attrs == {'class': ['details']}:
+                detail_tables.append(item)
+            else:
+                detail_tables.append("")
+
+        for detail_table in detail_tables:
+            if detail_table != '':
+                items = [item.text for item in detail_table.find_all('code')]
+            else:
+                items = ""
+            arguments.append(items)
+
+        for detail_table in detail_tables:
+            if detail_table != '':
+                items = [item.text for item in detail_table.find_all('td')]
+                items = items[1::3]
+            else:
+                items = ""
+            types.append(items)
+
+        for detail_table in detail_tables:
+            if detail_table != '':
+                items = [item.text for item in detail_table.find_all('p')]
+            else:
+                items = ""
+            details.append(items)
+
+        csv_file = open(outfile, 'w')
+        csv_writer = csv.writer(csv_file, delimiter='\t')
+
+        csv_writer.writerow(
+            ['name', 'description', 'function', 'returns', 'argument', 'type', 'details'])
+
+        for i in range(len(names)):
+            name = names[i]
+            description = descriptions[i]
+            function = functions[i]
+            return_type = returns[i]
+            argument = '|'.join(arguments[i])
+            argu_type = '|'.join(types[i])
+            detail = '|'.join(details[i])
+
+            csv_writer.writerow(
+                [name, description, function, return_type, argument, argu_type, detail])
+
+        csv_file.close()
+
+    except Exception as e:
+        print(e)
+
+
+def read_api_csv():
+    """Extracts Earth Engine API from a csv file and returns a dictionary containing information about each function.
+
+    Returns:
+        dict: The dictionary containing information about each function, including name, description, function form, return type, arguments, html. 
+    """
+    import copy
+    import csv
+
+    pkg_dir = os.path.dirname(
+        pkg_resources.resource_filename("geemap", "geemap.py"))
+    data_dir = os.path.join(pkg_dir, 'data')
+    template_dir = os.path.join(data_dir, 'template')
+    csv_file = os.path.join(template_dir, 'ee_api_docs.csv')
+    html_file = os.path.join(template_dir, 'ee_api_docs.html')
+
+    with open(html_file) as f:
+        in_html_lines = f.readlines()
+
+    api_dict = {}
+
+    with open(csv_file, 'r') as f:
+        csv_reader = csv.DictReader(f, delimiter='\t')
+
+        for line in csv_reader:
+
+            out_html_lines = copy.copy(in_html_lines)
+            out_html_lines[65] = in_html_lines[65].replace(
+                'function_name', line['name'])
+            out_html_lines[66] = in_html_lines[66].replace(
+                'function_description', line.get('description'))
+            out_html_lines[74] = in_html_lines[74].replace(
+                'function_usage', line.get('function'))
+            out_html_lines[75] = in_html_lines[75].replace(
+                'function_returns', line.get('returns'))
+
+            arguments = line.get('argument')
+            types = line.get('type')
+            details = line.get('details')
+
+            if '|' in arguments:
+                argument_items = arguments.split('|')
+            else:
+                argument_items = [arguments]
+
+            if '|' in types:
+                types_items = types.split('|')
+            else:
+                types_items = [types]
+
+            if '|' in details:
+                details_items = details.split('|')
+            else:
+                details_items = [details]
+
+            out_argument_lines = []
+
+            for index in range(len(argument_items)):
+                in_argument_lines = in_html_lines[87:92]
+                in_argument_lines[1] = in_argument_lines[1].replace(
+                    'function_argument', argument_items[index])
+                in_argument_lines[2] = in_argument_lines[2].replace(
+                    'function_type', types_items[index])
+                in_argument_lines[3] = in_argument_lines[3].replace(
+                    'function_details', details_items[index])
+                out_argument_lines.append("".join(in_argument_lines))
+
+            out_html_lines = out_html_lines[:87] + \
+                out_argument_lines + out_html_lines[92:]
+
+            contents = ''.join(out_html_lines)
+
+            api_dict[line['name']] = {
+                'description': line.get('description'),
+                'function': line.get('function'),
+                'returns': line.get('returns'),
+                'argument': line.get('argument'),
+                'type': line.get('type'),
+                'details': line.get('details'),
+                'html': contents
+            }
+
+    return api_dict
+
+
+def ee_function_tree(name):
+    """Construct the tree structure based on an Earth Engine function. For example, the function "ee.Algorithms.FMask.matchClouds" will return a list ["ee.Algorithms", "ee.Algorithms.FMask", "ee.Algorithms.FMask.matchClouds"]
+
+    Args:
+        name (str): The name of the Earth Engine function
+
+    Returns:
+        list: The list for parent functions.
+    """
+    func_list = []
+    try:
+        items = name.split('.')
+        if items[0] == 'ee':
+            for i in range(2, len(items) + 1):
+                func_list.append('.'.join(items[0:i]))
+        else:
+            for i in range(1, len(items) + 1):
+                func_list.append('.'.join(items[0:i]))
+
+        return func_list
+    except Exception as e:
+        print(e)
+        print('The provided function name is invalid.')
+
+
+def build_api_tree(api_dict, output_widget, layout_width='100%'):
+    """Builds an Earth Engine API tree view.
+
+    Args:
+        api_dict (dict): The dictionary containing information about each Earth Engine API function.
+        output_widget (object): An Output widget.
+        layout_width (str, optional): The percentage width of the widget. Defaults to '100%'.
+
+    Returns:
+        tuple: Returns a tuple containing two items: a tree Output widget and a tree dictionary.
+    """
+    from ipytree import Tree, Node
+    import warnings
+    warnings.filterwarnings('ignore')
+
+    tree = Tree()
+    tree_dict = {}
+
+    names = api_dict.keys()
+
+    def handle_click(event):
+        if event['new']:
+            name = event['owner'].name
+            values = api_dict[name]
+
+            with output_widget:
+                output_widget.clear_output()
+                html_widget = widgets.HTML(value=values['html'])
+                display(html_widget)
+
+    for name in names:
+        func_list = ee_function_tree(name)
+        first = func_list[0]
+
+        if first not in tree_dict.keys():
+            tree_dict[first] = Node(first)
+            tree_dict[first].opened = False
+            tree.add_node(tree_dict[first])
+
+        for index, func in enumerate(func_list):
+            if index > 0:
+                if func not in tree_dict.keys():
+                    node = tree_dict[func_list[index - 1]]
+                    node.opened = False
+                    tree_dict[func] = Node(func)
+                    node.add_node(tree_dict[func])
+
+                    if index == len(func_list) - 1:
+                        node = tree_dict[func_list[index]]
+                        node.icon = 'file'
+                        node.observe(handle_click, 'selected')
+
+    return tree, tree_dict
+
+
+def search_api_tree(keywords, api_tree):
+    """Search Earth Engine API and return functions containing the specified keywords
+
+    Args:
+        keywords (str): The keywords to search for.
+        api_tree (dict): The dictionary containing the Earth Engine API tree.
+
+    Returns:
+        object: An ipytree object/widget.
+    """
+    from ipytree import Tree, Node
+    import warnings
+    warnings.filterwarnings('ignore')
+
+    sub_tree = Tree()
+
+    for key in api_tree.keys():
+        if keywords in key:
+            sub_tree.add_node(api_tree[key])
+
+    return sub_tree
+
+
+def ee_search():
+    """Search Earth Engine API and user assets. If you received a warning (IOPub message rate exceeded) in Jupyter notebook, you can relaunch Jupyter notebook using the following command:
+        jupyter notebook --NotebookApp.iopub_msg_rate_limit=10000
+    """
+    import warnings
+    warnings.filterwarnings('ignore')
+
+    search_type = widgets.ToggleButtons(
+        options=['Scripts', 'Docs', 'Assets'],
+        tooltips=['Search Earth Engine Scripts',
+                  'Search Earth Engine API', 'Search Earth Engine Assets'],
+        button_style='primary'
+
+    )
+    search_type.style.button_width = '100px'
+
+    search_box = widgets.Text(placeholder='Filter scripts...')
+    search_box.layout.width = '310px'
+
+    tree_widget = widgets.Output()
+    with tree_widget:
+        print('Coming soon...')
+
+    left_widget = widgets.VBox()
+    right_widget = widgets.Output()
+    right_widget.layout.max_width = '650px'
+
+    left_widget.children = [search_type, search_box, tree_widget]
+
+    search_widget = widgets.HBox()
+    search_widget.children = [left_widget, right_widget]
+
+    display(search_widget)
+
+    api_dict = read_api_csv()
+    ee_api_tree, tree_dict = build_api_tree(api_dict, right_widget)
+
+    def search_type_changed(change):
+        search_box.value = ''
+
+        right_widget.clear_output()
+        tree_widget.clear_output()
+        if change['new'] == 'Scripts':
+            search_box.placeholder = 'Filter scripts...'
+        elif change['new'] == 'Docs':
+            search_box.placeholder = 'Filter methods...'
+            with tree_widget:
+                tree_widget.clear_output()
+                print('Loading...')
+                tree_widget.clear_output(wait=True)
+                display(ee_api_tree)
+
+        elif change['new'] == 'Assets':
+            search_box.placeholder = 'Filter assets...'
+
+    search_type.observe(search_type_changed, names='value')
+
+    def search_box_callback(text):
+
+        with tree_widget:
+            if text.value == '':
+                print('Loading...')
+                tree_widget.clear_output(wait=True)
+                display(ee_api_tree)
+            else:
+                tree_widget.clear_output()
+                print('Searching...')
+                tree_widget.clear_output(wait=True)
+                sub_tree = search_api_tree(text.value, tree_dict)
+                display(sub_tree)
+    search_box.on_submit(search_box_callback)
